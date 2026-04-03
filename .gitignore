@@ -1,4 +1,7 @@
 .Rproj.user
+.Rhistory
+.Renviron
+.env
 *.csv
 *.RData
 *.rds
