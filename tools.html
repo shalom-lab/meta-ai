@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文献初筛工具箱</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+    <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; }
+        .tab-active { border-bottom: 3px solid #6366f1; color: #6366f1; font-weight: 800; }
+        .animate-fade { animation: fadeIn 0.3s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; } }
+        .custom-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+        .custom-scroll::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo, useEffect, useRef } = React;
+
+        const getSafeVal = (obj, keys, fallback = "") => {
+            if (!obj) return fallback;
+            for (const key of keys) {
+                if (obj[key] !== undefined && obj[key] !== null) return obj[key];
+            }
+            return fallback;
+        };
+
+        const downloadAsCsv = (data, fileName) => {
+            const csv = Papa.unparse(data);
+            const blob = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.download = `${fileName}.csv`;
+            link.click();
+        };
+
+        // --- IndexedDB：用于刷新后仍保留“导入数据 + 人工决策结果”
+        const REVIEW_DB_NAME = 'meta_ai_reviewer_db';
+        const REVIEW_DB_VERSION = 1;
+        const STORE_FILE = 'reviewer_file';   // 保存：导入后的 list + fileName
+        const STORE_STATE = 'reviewer_state'; // 保存：marks + idx
+        const ACTIVE_SESSION_ID = 'active';
+
+        function openReviewDB() {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open(REVIEW_DB_NAME, REVIEW_DB_VERSION);
+                req.onupgradeneeded = () => {
+                    const db = req.result;
+                    if (!db.objectStoreNames.contains(STORE_FILE)) {
+                        db.createObjectStore(STORE_FILE, { keyPath: 'sessionId' });
+                    }
+                    if (!db.objectStoreNames.contains(STORE_STATE)) {
+                        db.createObjectStore(STORE_STATE, { keyPath: 'sessionId' });
+                    }
+                };
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        }
+
+        async function idbGet(storeName, key) {
+            const db = await openReviewDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(storeName, 'readonly');
+                const store = tx.objectStore(storeName);
+                const req = store.get(key);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        }
+
+        async function idbPut(storeName, value) {
+            const db = await openReviewDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(storeName, 'readwrite');
+                const store = tx.objectStore(storeName);
+                const req = store.put(value);
+                req.onsuccess = () => resolve(true);
+                req.onerror = () => reject(req.error);
+            });
+        }
+
+        function App() {
+            const [activeTab, setActiveTab] = useState(() => {
+                return localStorage.getItem('meta_ai_activeTab') || 'intro';
+            });
+
+            useEffect(() => {
+                localStorage.setItem('meta_ai_activeTab', activeTab);
+            }, [activeTab]);
+
+            useEffect(() => {
+                // 如果本地已有复核进度，刷新后默认切到“人工复核”页
+                (async () => {
+                    try {
+                        const stateRec = await idbGet(STORE_STATE, ACTIVE_SESSION_ID);
+                        const savedMarks = (stateRec && stateRec.marks) ? stateRec.marks : {};
+                        if (savedMarks && Object.keys(savedMarks).length > 0) {
+                            setActiveTab('reviewer');
+                        }
+                    } catch (e) {
+                        // 忽略失败（如浏览器禁用存储等）
+                    }
+                })();
+            }, []);
+
+            return (
+                <div className="min-h-screen pb-10">
+                    <nav className="bg-white border-b sticky top-0 z-50 shadow-sm">
+                        <div className="max-w-7xl mx-auto px-6 flex items-center justify-between">
+                            <div className="flex gap-8">
+                                <button
+                                    onClick={() => setActiveTab('intro')}
+                                    className={`py-5 text-sm transition-all ${activeTab === 'intro' ? 'tab-active' : 'text-gray-400 hover:text-gray-600'}`}
+                                >
+                                    1. 工具介绍
+                                </button>
+                                <button
+                                    onClick={() => setActiveTab('converter')}
+                                    className={`py-5 text-sm transition-all ${activeTab === 'converter' ? 'tab-active' : 'text-gray-400 hover:text-gray-600'}`}
+                                >
+                                    2. RIS 转 CSV
+                                </button>
+                                <button
+                                    onClick={() => setActiveTab('reviewer')}
+                                    className={`py-5 text-sm transition-all ${activeTab === 'reviewer' ? 'tab-active' : 'text-gray-400 hover:text-gray-600'}`}
+                                >
+                                    3. 文献人工复核
+                                </button>
+                            </div>
+                            <div className="text-[11px] font-bold text-gray-400 bg-gray-50 px-3 py-1.5 rounded-full border border-gray-100 whitespace-nowrap">
+                                当前版本 V1.1.0
+                            </div>
+                        </div>
+                    </nav>
+                    <main className="max-w-7xl mx-auto px-6 mt-8">
+                        {activeTab === 'intro' && <IntroPage />}
+                        {activeTab === 'converter' && <ConverterPage />}
+                        {activeTab === 'reviewer' && <ReviewerPage />}
+                    </main>
+                </div>
+            );
+        }
+
+        const R_EXAMPLE_CODE = `library(httr)
+library(jsonlite)
+library(tidyverse)
+
+
+# df.1 <- read_csv("Data/Global_health_1_500.csv")
+
+system_prompt <- paste(
+  "你是一个专门用于 RSV 儿童流行病学 Meta 分析文献初筛的助手。",
+  "请严格遵守以下规则：",
+  "1. 保守但不死板：只有当文章明显不相关或不符合纳入标准时才排除。",
+  "2. 如果信息不足但可能符合条件，请不要排除（exclude=0），并降低 exclude_prob。",
+  "3. 输出必须是 JSON：",
+  "{\\"exclude\\": 0_or_1, \\"exclude_prob\\": 0.0_to_1.0, \\"reason\\": \\"中文简短说明\\"}",
+  "4. 不要输出 JSON 之外任何内容。",
+  "",
+  "筛选标准：",
+  "- 年龄：≤5岁儿童,如果研究的年龄段包含儿童段的也不应该删除哦",
+  "- 必须报告 RSV 发病率/住院率/死亡率，而不是简单的病例数发病数",
+  "- 地区：中低收入国家（排除高收入国家），如果是多个地区的，只有全部都是高收入的时候才排除",
+  "- 时间：2019年底前（排除新冠后研究），如果完全是新冠后的请排除，包含新冠前的不排除",
+  sep = "\\n"
+)
+
+build_prompt <- function(TI, AB) {
+  paste0(
+    "标题:\\n", TI, "\\n\\n",
+    "摘要:\\n", AB, "\\n\\n",
+    "请根据规则判断是否排除。"
+  )
+}
+
+# qwen-plus-2025-07-28 处理到df.2_7 939
+# qwen-plus
+# qwen-flash
+
+call_qwen <- function(prompt, api_key, system_prompt) {
+
+  url <- "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+
+  res <- POST(
+    url,
+    add_headers(
+      Authorization = paste("Bearer", api_key),
+      "Content-Type" = "application/json"
+    ),
+    body = toJSON(list(
+      model = "qwen-flash", # 我试了上面3个模型
+      input = list(
+        messages = list(
+          list(role = "system", content = system_prompt),
+          list(role = "user", content = prompt)
+        )
+      ),
+      parameters = list(
+        temperature = 0,
+        max_tokens = 200
+      )
+    ), auto_unbox = TRUE)
+  )
+
+  content(res, as = "parsed", encoding = "UTF-8")
+}
+
+parse_result <- function(x) {
+  tryCatch({
+    jsonlite::fromJSON(x)
+  }, error = function(e) {
+    list(exclude = NA, exclude_prob = NA, reason = "解析失败")
+  })
+}
+
+api_key <- "your api key"
+
+
+# https://bailian.console.aliyun.com/cn-beijing?tab=api#/api 如何获取APIKEY
+
+# df.1 ----
+# df.1$prompt <- map2_chr(df.1$TI, df.1$AB, build_prompt)
+# df.1$response <- NA
+# df.1$raw_text <- NA
+# df.1$exclude <- NA
+# df.1$exclude_prob <- NA
+# df.1$reason <- NA
+
+for (i in 1:nrow(df.1)) {
+  cat("Processing row:", i, "\\n")
+  if (!is.na(df.1$raw_text[i])) {
+    next
+  }
+  tryCatch({
+    res <- call_qwen(df.1$prompt[i], api_key, system_prompt)
+    if (!is.null(res$output$text)) {
+      df.1$raw_text[i] <- res$output$text
+      parsed <- parse_result(res$output$text)
+      df.1$exclude[i] <- parsed$exclude
+      df.1$exclude_prob[i] <- parsed$exclude_prob
+      df.1$reason[i] <- parsed$reason
+    } else {
+      cat("⚠️ No response at row:", i, "\\n")
+    }
+  }, error = function(e) {
+    cat("❌ Error at row:", i, "\\n")
+  })
+}
+`;
+
+        // --- 页面 0: 工具介绍 ---
+        function IntroPage() {
+            return (
+                <div className="space-y-8 animate-fade">
+                    <div className="relative overflow-hidden rounded-[2.25rem] border shadow-sm bg-gradient-to-br from-indigo-50 via-white to-amber-50">
+                        <div className="absolute -top-24 -right-24 w-72 h-72 bg-indigo-200/40 blur-3xl rounded-full" />
+                        <div className="absolute -bottom-24 -left-24 w-72 h-72 bg-amber-200/40 blur-3xl rounded-full" />
+                        <div className="relative p-8 lg:p-10">
+                            <div className="flex flex-wrap items-center gap-2 mb-5">
+                                <span className="text-[11px] font-black tracking-widest uppercase px-3 py-1.5 rounded-full bg-white/80 border border-white shadow-sm text-indigo-700">Local-first</span>
+                                <span className="text-[11px] font-black tracking-widest uppercase px-3 py-1.5 rounded-full bg-white/80 border border-white shadow-sm text-amber-700">IndexedDB 进度保存</span>
+                                <span className="text-[11px] font-black tracking-widest uppercase px-3 py-1.5 rounded-full bg-white/80 border border-white shadow-sm text-gray-700">快捷键浏览</span>
+                            </div>
+                            <h1 className="text-3xl lg:text-4xl font-black text-gray-900 leading-tight">
+                                文献初筛与人工复核工具箱
+                            </h1>
+                            <p className="text-gray-700 leading-relaxed text-sm lg:text-base mt-4 max-w-3xl">
+                                从 <span className="font-extrabold text-indigo-700">RIS 转 CSV</span> 到 <span className="font-extrabold text-indigo-700">AI 初筛</span> 再到
+                                <span className="font-extrabold text-indigo-700">人工复核导出</span>，把流程压缩成一条清晰的“流水线”。页面在本地浏览器运行，刷新也能恢复进度。
+                            </p>
+
+                            <div className="mt-7 grid grid-cols-1 md:grid-cols-3 gap-4">
+                                <div className="bg-white/80 backdrop-blur rounded-2xl border border-white shadow-sm p-5">
+                                    <div className="flex items-center gap-3">
+                                        <div className="w-10 h-10 rounded-2xl bg-indigo-600 text-white flex items-center justify-center font-black">1</div>
+                                        <div>
+                                            <div className="text-sm font-black text-gray-900">RIS → CSV</div>
+                                            <div className="text-xs text-gray-500">字段合并、预览、导出 BOM</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="bg-white/80 backdrop-blur rounded-2xl border border-white shadow-sm p-5">
+                                    <div className="flex items-center gap-3">
+                                        <div className="w-10 h-10 rounded-2xl bg-gray-900 text-white flex items-center justify-center font-black">2</div>
+                                        <div>
+                                            <div className="text-sm font-black text-gray-900">R 调用模型</div>
+                                            <div className="text-xs text-gray-500">写回 exclude / prob / reason</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="bg-white/80 backdrop-blur rounded-2xl border border-white shadow-sm p-5">
+                                    <div className="flex items-center gap-3">
+                                        <div className="w-10 h-10 rounded-2xl bg-amber-600 text-white flex items-center justify-center font-black">3</div>
+                                        <div>
+                                            <div className="text-sm font-black text-gray-900">人工复核导出</div>
+                                            <div className="text-xs text-gray-500">快捷键、跳转、进度持久化</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div className="bg-white p-6 rounded-3xl border shadow-sm space-y-4">
+                            <div className="flex items-center justify-between">
+                                <h2 className="text-lg font-black text-gray-900">如何使用 · 3 分钟上手</h2>
+                                <span className="text-[10px] font-black tracking-widest text-gray-400 uppercase">Quickstart</span>
+                            </div>
+                            <div className="space-y-3">
+                                <div className="p-4 rounded-2xl bg-indigo-50 border border-indigo-100">
+                                    <div className="text-xs font-black text-indigo-700 mb-1">Step 1</div>
+                                    <div className="text-sm font-bold text-gray-900">导出 RIS 并转成 CSV</div>
+                                    <div className="text-xs text-gray-600 mt-1">
+                                        进入 <span className="font-extrabold text-indigo-700">“2. RIS 转 CSV”</span>，上传 RIS，预览后导出 CSV（已带 BOM，Excel 友好）。
+                                    </div>
+                                </div>
+                                <div className="p-4 rounded-2xl bg-gray-50 border border-gray-100">
+                                    <div className="text-xs font-black text-gray-700 mb-1">Step 2</div>
+                                    <div className="text-sm font-bold text-gray-900">R 端调用模型写回结果</div>
+                                    <div className="text-xs text-gray-600 mt-1">
+                                        使用下方示例代码生成并写回 <span className="font-mono bg-white px-1 py-0.5 rounded">exclude / exclude_prob / reason</span>。
+                                    </div>
+                                </div>
+                                <div className="p-4 rounded-2xl bg-amber-50 border border-amber-100">
+                                    <div className="text-xs font-black text-amber-700 mb-1">Step 3</div>
+                                    <div className="text-sm font-bold text-gray-900">导入复核并导出最终 _checked</div>
+                                    <div className="text-xs text-gray-700 mt-1">
+                                        进入 <span className="font-extrabold text-indigo-700">“3. 文献人工复核”</span> 导入文件，完成后导出 <span className="font-mono bg-white px-1 py-0.5 rounded">_checked.csv</span>。
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="bg-white p-6 rounded-3xl border shadow-sm space-y-4">
+                            <div className="flex items-center justify-between">
+                                <h2 className="text-lg font-black text-gray-900">人工复核 · 快捷键速查</h2>
+                                <span className="text-[10px] font-black tracking-widest text-gray-400 uppercase">Hotkeys</span>
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                <div className="p-4 rounded-2xl border bg-gray-50">
+                                    <div className="text-xs font-black text-gray-500 mb-2">上一条</div>
+                                    <div className="flex flex-wrap gap-2">
+                                        {['←','↑','A','W'].map((k) => (
+                                            <span key={k} className="text-xs font-black px-2.5 py-1 rounded-xl bg-white border border-gray-200 text-gray-700">{k}</span>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="p-4 rounded-2xl border bg-gray-50">
+                                    <div className="text-xs font-black text-gray-500 mb-2">下一条</div>
+                                    <div className="flex flex-wrap gap-2">
+                                        {['→','↓','D','S','Space'].map((k) => (
+                                            <span key={k} className="text-xs font-black px-2.5 py-1 rounded-xl bg-white border border-gray-200 text-gray-700">{k}</span>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="p-4 rounded-2xl border bg-rose-50 border-rose-100 sm:col-span-2">
+                                    <div className="flex items-center justify-between gap-3">
+                                        <div>
+                                            <div className="text-xs font-black text-rose-700 mb-1">一键标记为排除</div>
+                                            <div className="text-xs text-rose-800/80">等价于点击右侧 “设为 排除”</div>
+                                        </div>
+                                        <span className="text-xs font-black px-3 py-1.5 rounded-xl bg-white border border-rose-200 text-rose-700">X</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="text-xs text-gray-500">
+                                小贴士：复核页会将进度保存在浏览器 <span className="font-semibold">IndexedDB</span>，刷新后会自动恢复到上次位置。
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-white p-6 rounded-3xl border shadow-sm space-y-3">
+                        <div className="flex items-center justify-between mb-3">
+                            <h2 className="text-lg font-bold text-gray-800">R 端示例代码</h2>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+                                        navigator.clipboard.writeText(R_EXAMPLE_CODE).then(() => {
+                                            alert('R 代码已复制到剪贴板');
+                                        }).catch(() => {
+                                            alert('复制失败，请手动选择代码复制');
+                                        });
+                                    } else {
+                                        alert('当前浏览器不支持一键复制，请手动选择代码复制');
+                                    }
+                                }}
+                                className="text-[11px] px-3 py-1.5 rounded-full border border-gray-200 text-gray-600 hover:bg-gray-50 hover:border-gray-300 font-semibold shadow-sm"
+                            >
+                                复制代码
+                            </button>
+                        </div>
+                        <pre className="bg-gray-900 text-gray-50 text-xs rounded-2xl p-4 overflow-x-auto overflow-y-auto custom-scroll max-h-72">
+<code>
+{`library(httr)
+library(jsonlite)
+library(tidyverse)
+
+
+# df.1 <- read_csv("Data/Global_health_1_500.csv")
+
+system_prompt <- paste(
+  "你是一个专门用于 RSV 儿童流行病学 Meta 分析文献初筛的助手。",
+  "请严格遵守以下规则：",
+  "1. 保守但不死板：只有当文章明显不相关或不符合纳入标准时才排除。",
+  "2. 如果信息不足但可能符合条件，请不要排除（exclude=0），并降低 exclude_prob。",
+  "3. 输出必须是 JSON：",
+  "{\\"exclude\\": 0_or_1, \\"exclude_prob\\": 0.0_to_1.0, \\"reason\\": \\"中文简短说明\\"}",
+  "4. 不要输出 JSON 之外任何内容。",
+  "",
+  "筛选标准：",
+  "- 年龄：≤5岁儿童,如果研究的年龄段包含儿童段的也不应该删除哦",
+  "- 必须报告 RSV 发病率/住院率/死亡率，而不是简单的病例数发病数",
+  "- 地区：中低收入国家（排除高收入国家），如果是多个地区的，只有全部都是高收入的时候才排除",
+  "- 时间：2019年底前（排除新冠后研究），如果完全是新冠后的请排除，包含新冠前的不排除",
+  sep = "\\n"
+)
+
+build_prompt <- function(TI, AB) {
+  paste0(
+    "标题:\\n", TI, "\\n\\n",
+    "摘要:\\n", AB, "\\n\\n",
+    "请根据规则判断是否排除。"
+  )
+}
+
+# qwen-plus-2025-07-28 处理到df.2_7 939
+# qwen-plus
+# qwen-flash
+
+call_qwen <- function(prompt, api_key, system_prompt) {
+
+  url <- "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+
+  res <- POST(
+    url,
+    add_headers(
+      Authorization = paste("Bearer", api_key),
+      "Content-Type" = "application/json"
+    ),
+    body = toJSON(list(
+      model = "qwen-flash", # 我试了上面3个模型
+      input = list(
+        messages = list(
+          list(role = "system", content = system_prompt),
+          list(role = "user", content = prompt)
+        )
+      ),
+      parameters = list(
+        temperature = 0,
+        max_tokens = 200
+      )
+    ), auto_unbox = TRUE)
+  )
+
+  content(res, as = "parsed", encoding = "UTF-8")
+}
+
+parse_result <- function(x) {
+  tryCatch({
+    jsonlite::fromJSON(x)
+  }, error = function(e) {
+    list(exclude = NA, exclude_prob = NA, reason = "解析失败")
+  })
+}
+
+api_key <- "your api key"
+
+
+# https://bailian.console.aliyun.com/cn-beijing?tab=api#/api 如何获取APIKEY
+
+# df.1 ----
+# df.1$prompt <- map2_chr(df.1$TI, df.1$AB, build_prompt)
+# df.1$response <- NA
+# df.1$raw_text <- NA
+# df.1$exclude <- NA
+# df.1$exclude_prob <- NA
+# df.1$reason <- NA
+
+for (i in 1:nrow(df.1)) {
+  cat("Processing row:", i, "\\n")
+  if (!is.na(df.1$raw_text[i])) {
+    next
+  }
+  tryCatch({
+    res <- call_qwen(df.1$prompt[i], api_key, system_prompt)
+    if (!is.null(res$output$text)) {
+      df.1$raw_text[i] <- res$output$text
+      parsed <- parse_result(res$output$text)
+      df.1$exclude[i] <- parsed$exclude
+      df.1$exclude_prob[i] <- parsed$exclude_prob
+      df.1$reason[i] <- parsed$reason
+    } else {
+      cat("⚠️ No response at row:", i, "\\n")
+    }
+  }, error = function(e) {
+    cat("❌ Error at row:", i, "\\n")
+  })
+}
+
+# 及时保存和导出结果
+save.image('rda/code.RData')
+write.csv(df.1,'rda/df.1.csv')
+
+`}
+</code>
+                        </pre>
+                        <div className="mt-3 bg-amber-50 border border-amber-100 rounded-2xl px-4 py-3 text-xs text-amber-900 flex flex-col gap-1.5">
+                            <div className="font-bold">温馨提示</div>
+                            <p>
+                                请将 AI 模型的输出视为<span className="font-semibold">辅助参考</span>，关键纳入/排除决策仍需人工严谨把关。
+                                对于边界条目，建议在本工具的“文献人工复核”页中再次仔细核查。
+                            </p>
+                            <p>
+                                当前示例使用的是阿里云通义千问 Qwen 接口，API 文档可参考：
+                                <a
+                                    href="https://bailian.console.aliyun.com/cn-beijing?tab=api#/api"
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="underline font-semibold text-amber-800 ml-1"
+                                >
+                                    阿里云百炼开放平台文档
+                                </a>
+                                。你也可以将 R 代码中的 <span className="font-mono bg-amber-100 px-1 py-0.5 rounded">call_qwen()</span> 替换为调用其他大模型（如本地模型或海外 API），再将结果写回 CSV 后导入本工具进行人工复核。
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // --- 页面 1: RIS 转换器 ---
+        function ConverterPage() {
+            const [risData, setRisData] = useState({ content: '', name: '' });
+            const [results, setResults] = useState([]);
+            const [showHint, setShowHint] = useState(true);
+
+            const tableHeaders = useMemo(() => {
+                if (results.length === 0) return [];
+                const keys = new Set();
+                results.slice(0, 50).forEach(row => Object.keys(row).forEach(k => keys.add(k)));
+                return Array.from(keys);
+            }, [results]);
+
+            const handleFile = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    setRisData({ content: ev.target.result, name: file.name });
+                    setResults([]);
+                };
+                reader.readAsText(file);
+            };
+
+            const convert = () => {
+                if (!risData.content) return;
+                const entries = risData.content.split(/ER\s+-\s*/);
+                const records = entries.map(entry => {
+                    const record = {};
+                    entry.split(/\r?\n/).forEach(line => {
+                        const m = line.trim().match(/^([A-Z0-9]{2})\s+-\s+(.*)$/);
+                        if (m) {
+                            const tag = m[1], val = m[2];
+                            record[tag] = record[tag] ? `${record[tag]}; ${val}` : val;
+                        }
+                    });
+                    return record;
+                }).filter(r => Object.keys(r).length);
+                setResults(records);
+            };
+
+            return (
+                <div className="space-y-6 animate-fade">
+                    {showHint && (
+                        <div className="bg-indigo-50 border border-indigo-100 p-5 rounded-2xl flex justify-between items-start shadow-sm">
+                            <div className="text-sm text-indigo-700">
+                                <p className="font-bold mb-1 italic tracking-tighter">转换指南：</p>
+                                <ul className="list-disc list-inside opacity-80 space-y-0.5">
+                                    <li>支持合并 RIS 中的重复标签（如多个 AU 作者字段）。</li>
+                                    <li>转换后可直接预览前 50 条数据。</li>
+                                    <li>导出 CSV 已内置 BOM，Excel 打开不会出现中文乱码。</li>
+                                </ul>
+                            </div>
+                            <button onClick={() => setShowHint(false)} className="text-indigo-300 hover:text-indigo-500 font-bold px-2 text-xl">✕</button>
+                        </div>
+                    )}
+
+                    <div className="bg-white p-8 rounded-3xl border shadow-sm">
+                        <h2 className="text-xl font-bold mb-6">RIS 转换为 CSV</h2>
+                        <div className="flex flex-wrap gap-4 items-center bg-gray-50 p-6 rounded-2xl border border-dashed border-gray-200">
+                            <input type="file" id="ris-up" onChange={handleFile} accept=".ris" className="hidden" />
+                            <label htmlFor="ris-up" className="px-6 py-2.5 bg-white border border-indigo-200 text-indigo-600 rounded-xl font-bold cursor-pointer hover:bg-indigo-50 shadow-sm text-sm">选择 RIS 文件</label>
+                            <span className="text-sm font-medium text-gray-400 truncate max-w-[200px]">{risData.name || "未选择文件"}</span>
+                            <button onClick={convert} disabled={!risData.content} className="px-8 py-2.5 bg-indigo-600 text-white rounded-xl font-bold shadow-lg shadow-indigo-100 disabled:opacity-30 text-sm">开始转换预览</button>
+                            <button onClick={() => downloadAsCsv(results, risData.name.replace('.ris', ''))} disabled={!results.length} className="px-8 py-2.5 bg-white border border-gray-200 rounded-xl font-bold hover:bg-gray-50 disabled:opacity-30 text-gray-600 text-sm shadow-sm">导出 CSV</button>
+                        </div>
+                    </div>
+
+                    {results.length > 0 && (
+                        <div className="bg-white rounded-3xl border shadow-sm overflow-hidden animate-fade">
+                            <div className="px-6 py-4 bg-gray-50 border-b flex justify-between items-center">
+                                <span className="text-xs font-bold text-gray-500 uppercase tracking-widest">数据预览 (共 {results.length} 条记录)</span>
+                            </div>
+                            <div className="overflow-x-auto custom-scroll max-h-[500px]">
+                                <table className="w-full text-left border-collapse">
+                                    <thead className="bg-white sticky top-0 shadow-sm z-10">
+                                        <tr>
+                                            {tableHeaders.map(header => (
+                                                <th key={header} className="p-4 text-[10px] font-black text-gray-400 uppercase border-b whitespace-nowrap bg-white">{header}</th>
+                                            ))}
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-50">
+                                        {results.slice(0, 50).map((row, i) => (
+                                            <tr key={i} className="hover:bg-indigo-50/30 transition-colors">
+                                                {tableHeaders.map(header => (
+                                                    <td key={header} className="p-4 text-xs text-gray-600 truncate max-w-[250px]" title={row[header]}>{row[header] || "-"}</td>
+                                                ))}
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // --- 页面 2: 复核页面 ---
+        function ReviewerPage() {
+            const [list, setList] = useState([]);
+            const [idx, setIdx] = useState(0);
+            const [marks, setMarks] = useState({});
+            const [fileName, setFileName] = useState('');
+            const [showHint, setShowHint] = useState(true);
+            const [jumpTo, setJumpTo] = useState('');
+            const [hydrated, setHydrated] = useState(false);
+            const restoringRef = useRef(true);
+            const hasList = list && list.length > 0;
+
+            const handleUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const baseName = file.name.replace(/\.[^/.]+$/, "");
+                setFileName(baseName);
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    let data = [];
+                    if (file.name.endsWith('.csv')) {
+                        data = Papa.parse(ev.target.result, { header: true, skipEmptyLines: true }).data;
+                    } else {
+                        const wb = XLSX.read(ev.target.result, { type: 'binary' });
+                        data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+                    }
+                    const initMarks = {};
+                    data.forEach((row, i) => {
+                        const val = String(getSafeVal(row, ['exclude', 'EXCLUDE'], '0')).toLowerCase();
+                        initMarks[i] = (val === '1' || val === 'true') ? '1' : '0';
+                    });
+                    setList(data);
+                    setMarks(initMarks);
+                    setIdx(0);
+
+                    // 写入 IndexDB：导入数据 + 人工结果，刷新后可恢复
+                    localStorage.setItem('meta_ai_activeTab', 'reviewer');
+                    setTimeout(() => {
+                        idbPut(STORE_FILE, { sessionId: ACTIVE_SESSION_ID, fileName: baseName, list: data });
+                        idbPut(STORE_STATE, { sessionId: ACTIVE_SESSION_ID, marks: initMarks, idx: 0 });
+                    }, 0);
+                };
+                if (file.name.endsWith('.csv')) reader.readAsText(file, "UTF-8");
+                else reader.readAsBinaryString(file);
+            };
+
+            const cur = hasList ? list[idx] : null;
+            const isExcluded = hasList && marks[idx] === '1';
+
+            useEffect(() => {
+                // 加载本地持久化进度（刷新后恢复）
+                (async () => {
+                    try {
+                        const [fileRec, stateRec] = await Promise.all([
+                            idbGet(STORE_FILE, ACTIVE_SESSION_ID),
+                            idbGet(STORE_STATE, ACTIVE_SESSION_ID),
+                        ]);
+                        if (fileRec && Array.isArray(fileRec.list) && fileRec.list.length >= 0) {
+                            const data = fileRec.list || [];
+                            const savedMarks = (stateRec && stateRec.marks) ? stateRec.marks : {};
+                            // 若保存的 marks 不完整，按当前 list 的 exclude 列补齐
+                            const hasAnyMark = savedMarks && Object.keys(savedMarks).length > 0;
+                            let finalMarks = savedMarks;
+                            if (!hasAnyMark) finalMarks = {};
+                            for (let i = 0; i < data.length; i++) {
+                                if (finalMarks[i] === '0' || finalMarks[i] === '1') continue;
+                                const val = String(getSafeVal(data[i], ['exclude', 'EXCLUDE'], '0')).toLowerCase();
+                                finalMarks[i] = (val === '1' || val === 'true') ? '1' : '0';
+                            }
+                            setFileName(fileRec.fileName || '');
+                            setList(data);
+                            setMarks(finalMarks);
+                            const savedIdx = stateRec ? stateRec.idx : undefined;
+                            if (typeof savedIdx === 'number' && savedIdx >= 0 && savedIdx < data.length) {
+                                setIdx(savedIdx);
+                            } else {
+                                // 默认落到第一个 exclude=0（便于“再核实”）
+                                let firstKeep = 0;
+                                for (let i = 0; i < data.length; i++) {
+                                    if (finalMarks[i] === '0') {
+                                        firstKeep = i;
+                                        break;
+                                    }
+                                }
+                                setIdx(firstKeep);
+                            }
+                            localStorage.setItem('meta_ai_activeTab', 'reviewer');
+                        }
+                    } catch (e) {
+                        // 忽略失败
+                    } finally {
+                        restoringRef.current = false;
+                        setHydrated(true);
+                    }
+                })();
+            }, []);
+
+            useEffect(() => {
+                // 键盘快捷键：方向键 / WASD / 空格切换条目，X 设为排除
+                const handleKey = (e) => {
+                    if (!hasList) return;
+                    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+                    const key = e.key;
+                    if (key === 'ArrowLeft' || key === 'ArrowUp' || key === 'a' || key === 'A' || key === 'w' || key === 'W') {
+                        setIdx((i) => Math.max(0, i - 1));
+                    } else if (key === 'ArrowRight' || key === 'ArrowDown' || key === 'd' || key === 'D' || key === 's' || key === 'S' || key === ' ') {
+                        e.preventDefault();
+                        setIdx((i) => Math.min(list.length - 1, i + 1));
+                    } else if (key === 'x' || key === 'X') {
+                        setMarks((prev) => ({ ...prev, [idx]: '1' }));
+                    }
+                };
+                window.addEventListener('keydown', handleKey);
+                return () => window.removeEventListener('keydown', handleKey);
+            }, [hasList, list.length, idx]);
+
+            useEffect(() => {
+                // marks/idx 变化时保存，避免刷新导致人工决策丢失
+                if (!hydrated) return;
+                if (!list || !list.length) return;
+                if (restoringRef.current) return;
+                idbPut(STORE_STATE, { sessionId: ACTIVE_SESSION_ID, marks, idx });
+            }, [hydrated, list, marks, idx]);
+
+            const exclude0Indexes = useMemo(() => {
+                if (!list || !list.length) return [];
+                const arr = [];
+                for (let i = 0; i < list.length; i++) {
+                    if (marks[i] === '0') arr.push(i);
+                }
+                return arr;
+            }, [marks, list.length]);
+
+            const handleJump = () => {
+                if (!list || !list.length) return;
+                const n = Number(jumpTo);
+                if (!Number.isFinite(n)) return;
+                const targetIdx = Math.max(0, Math.min(list.length - 1, n - 1));
+                setIdx(targetIdx);
+            };
+
+            return (
+                <div className="space-y-6 animate-fade">
+                    {showHint && (
+                        <div className="bg-amber-50 border border-amber-100 p-5 rounded-2xl flex justify-between items-start shadow-sm">
+                            <div className="text-sm text-amber-800">
+                                <p className="font-bold mb-1 italic tracking-tighter">人工复核贴士：</p>
+                                <ul className="list-disc list-inside opacity-80 space-y-0.5">
+                                    <li>系统会自动寻找 <strong>TI/Title</strong> 和 <strong>AB/Abstract</strong> 列名。</li>
+                                    <li>AI 预测信息已置顶显示，且放大了字体方便阅读。</li>
+                                    <li>变量缺失不会报错，导出时将保存您的人工决策结果。</li>
+                                </ul>
+                            </div>
+                            <button onClick={() => setShowHint(false)} className="text-amber-300 hover:text-amber-500 font-bold px-2 text-xl">✕</button>
+                        </div>
+                    )}
+
+                    <div className="bg-white p-4 rounded-2xl border shadow-sm flex justify-between items-center">
+                        <div className="flex gap-4 items-center">
+                            <input type="file" id="rev-in" className="hidden" onChange={handleUpload} accept=".csv,.xlsx" />
+                            <label htmlFor="rev-in" className="px-5 py-2 bg-indigo-600 text-white rounded-xl font-bold cursor-pointer text-sm">导入复核数据</label>
+                            {list.length > 0 && <span className="text-sm font-bold text-gray-400 bg-gray-50 px-4 py-1.5 rounded-xl">进度：{idx+1} / {list.length}</span>}
+                            {list.length > 0 && (
+                                <div className="flex items-center gap-2">
+                                    <input
+                                        type="number"
+                                        min={1}
+                                        max={list.length}
+                                        value={jumpTo}
+                                        onChange={(e) => setJumpTo(e.target.value)}
+                                        onKeyDown={(e) => { if (e.key === 'Enter') handleJump(); }}
+                                        placeholder="跳转行号(1..N)"
+                                        className="w-40 px-3 py-2 border rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-200"
+                                    />
+                                    <button onClick={handleJump} className="px-4 py-2 bg-gray-900 text-white rounded-xl font-bold text-sm shadow-sm hover:bg-gray-800">
+                                        跳转
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                        <div className="flex items-center gap-3">
+                            <span className="text-sm font-bold text-gray-500 bg-gray-50 px-3 py-2 rounded-xl border border-gray-100 max-w-[280px] truncate" title={fileName || "未上传文件"}>
+                                当前文件：{fileName || "未上传文件"}
+                            </span>
+                            <button onClick={() => downloadAsCsv(list.map((r, i) => ({ ...r, exclude: marks[i] })), `${fileName}_checked`)}
+                                disabled={!list.length} className="px-5 py-2 bg-amber-500 text-white rounded-xl font-bold text-sm shadow-md shadow-amber-100 disabled:opacity-30">
+                                导出结果 (_checked.csv)
+                            </button>
+                        </div>
+                    </div>
+
+                    {list.length > 0 ? (
+                        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                            <div className="lg:col-span-8 space-y-6">
+                                <div className="bg-white p-8 rounded-[2rem] border shadow-sm">
+                                    <span className="text-[10px] font-bold text-gray-300 uppercase tracking-widest block mb-3">标题 (TI)</span>
+                                    <h2 className="text-2xl font-black text-gray-800 leading-tight">
+                                        {getSafeVal(cur, ['TI', 'Title', 'title'], "无标题内容")}
+                                    </h2>
+                                </div>
+                                <div className="bg-white p-8 rounded-[2rem] border shadow-sm h-[500px] overflow-auto custom-scroll">
+                                    <span className="text-[10px] font-bold text-gray-300 uppercase tracking-widest block mb-3">摘要 (AB)</span>
+                                    <p className="text-gray-600 leading-relaxed text-base whitespace-pre-wrap font-medium">
+                                        {getSafeVal(cur, ['AB', 'Abstract', 'abstract'], "该文献未提供摘要内容。")}
+                                    </p>
+                                </div>
+                                <div className="flex justify-between">
+                                    <button onClick={() => setIdx(i => Math.max(0, i-1))} className="px-10 py-3 bg-white border rounded-2xl font-bold shadow-sm hover:bg-gray-50 transition-all text-sm">上一个</button>
+                                    <button onClick={() => setIdx(i => Math.min(list.length-1, i+1))} className="px-10 py-3 bg-white border rounded-2xl font-bold shadow-sm hover:bg-gray-50 transition-all text-sm">下一个</button>
+                                </div>
+                            </div>
+
+                            <div className="lg:col-span-4 space-y-6">
+                                <div className="bg-indigo-50/50 p-8 rounded-[2rem] border border-indigo-100 border-dashed space-y-6">
+                                    <div>
+                                        <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-widest block mb-2">排除概率 (EXCLUDE_PROB)</span>
+                                        <span className="text-3xl font-black text-indigo-900">
+                                            {getSafeVal(cur, ['exclude_prob', 'prob']) ? (Number(getSafeVal(cur, ['exclude_prob', 'prob'])) * 100).toFixed(1) + '%' : '未知'}
+                                        </span>
+                                    </div>
+                                    <div className="pt-4 border-t border-indigo-100/50">
+                                        <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-widest block mb-2">排除原因 (EXCLUDE_REASON)</span>
+                                        <p className="text-xl font-bold text-indigo-800 leading-snug">
+                                            {getSafeVal(cur, ['exclude_reason', 'reason', 'exclude_reasonb'], "未提供 AI 生成的建议原因。")}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                <div className={`p-8 rounded-[2.5rem] border-4 text-center transition-all ${isExcluded ? 'bg-rose-50 border-rose-100' : 'bg-emerald-50 border-emerald-100'}`}>
+                                    <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">当前决策状态</p>
+                                    <span className={`text-4xl font-black ${isExcluded ? 'text-rose-600' : 'text-emerald-600'}`}>
+                                        {isExcluded ? '排除' : '保留'}
+                                    </span>
+                                </div>
+
+                                <div className="bg-white p-6 rounded-[2rem] border shadow-sm flex gap-3">
+                                    <button onClick={() => setMarks({...marks, [idx]: '0'})}
+                                        className={`flex-1 py-3.5 rounded-xl font-bold text-sm transition-all border-2 ${marks[idx]==='0' ? 'bg-emerald-600 text-white border-emerald-600' : 'text-gray-300 border-gray-100 hover:border-emerald-100'}`}>
+                                        设为 保留
+                                    </button>
+                                    <button onClick={() => setMarks({...marks, [idx]: '1'})}
+                                        className={`flex-1 py-3.5 rounded-xl font-bold text-sm transition-all border-2 ${marks[idx]==='1' ? 'bg-rose-600 text-white border-rose-600' : 'text-gray-300 border-gray-100 hover:border-rose-100'}`}>
+                                        设为 排除
+                                    </button>
+                                </div>
+
+                                <div className="bg-white p-6 rounded-[2rem] border shadow-sm">
+                                    <div className="flex items-center justify-between mb-4">
+                                        <span className="text-[10px] font-bold text-gray-300 uppercase tracking-widest">再核实位置（exclude=0）</span>
+                                        <span className="text-[10px] font-bold text-gray-400">{exclude0Indexes.length} 条</span>
+                                    </div>
+
+                                    {exclude0Indexes.length ? (
+                                        <div className="max-h-52 overflow-auto custom-scroll grid grid-cols-4 gap-2">
+                                            {exclude0Indexes.map((i) => {
+                                                const t = String(getSafeVal(list[i], ['TI', 'Title', 'title'], '无标题')).trim();
+                                                const tip = t.length > 22 ? `${t.slice(0, 22)}...` : t;
+                                                return (
+                                                    <button
+                                                        key={i}
+                                                        onClick={() => setIdx(i)}
+                                                        title={`第 ${i+1} 条：${tip}`}
+                                                        className={`py-2 rounded-xl text-xs font-bold border transition-all ${
+                                                            i === idx
+                                                                ? 'bg-amber-50 border-amber-300 text-amber-800 ring-2 ring-amber-200'
+                                                                : 'bg-gray-50 border-gray-200 text-gray-700 hover:bg-gray-100'
+                                                        }`}
+                                                    >
+                                                        {i+1}
+                                                    </button>
+                                                );
+                                            })}
+                                        </div>
+                                    ) : (
+                                        <div className="text-sm text-gray-400">暂无 exclude=0 的条目</div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="h-96 flex flex-col items-center justify-center border-4 border-dashed rounded-[3rem] text-gray-300 bg-white/50 border-gray-100">
+                            <p className="font-black text-lg">请导入数据开始复核</p>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
